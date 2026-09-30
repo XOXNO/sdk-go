@@ -30,7 +30,13 @@ type Quote struct {
 	PriceImpact               *float64
 	NetworkFee                *big.Int
 }
-type RouteHop struct{ Venue, Kind, Pool, From, To string }
+type RouteHop struct {
+	Venue string `json:"venue"`
+	Kind  string `json:"kind"`
+	Pool  string `json:"pool"`
+	From  string `json:"from"`
+	To    string `json:"to"`
+}
 type Transaction struct {
 	EnvelopeXDR        string `json:"envelopeXdr"`
 	RouterContract     string `json:"routerContract"`

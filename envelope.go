@@ -34,18 +34,11 @@ type envelopeExpectation struct {
 // sequence number and expiry so the client can sign it as is, and returns the
 // envelope's fee in stroops.
 func prepareEnvelope(envelopeB64 string, want envelopeExpectation, seq int64, maxTime int64) (string, uint32, error) {
-	env, err := decodeEnvelope(envelopeB64)
+	env, invoke, err := ValidateUnsignedSorobanEnvelope(envelopeB64, want.Sender, maxEnvelopeFee)
 	if err != nil {
 		return "", 0, err
 	}
 	tx := &env.V1.Tx
-	if err := checkTransaction(tx, want.Sender); err != nil {
-		return "", 0, err
-	}
-	invoke, err := singleInvocation(tx.Operations[0])
-	if err != nil {
-		return "", 0, err
-	}
 	if err := checkRouterCall(invoke.HostFunction.InvokeContract, want); err != nil {
 		return "", 0, err
 	}
@@ -77,6 +70,20 @@ func prepareEnvelope(envelopeB64 string, want envelopeExpectation, seq int64, ma
 	return out, uint32(tx.Fee), nil
 }
 
+// ValidateUnsignedSorobanEnvelope checks the common unsigned signing envelope.
+// Router, trade, authorization, sequence and expiry policy remain with the caller.
+func ValidateUnsignedSorobanEnvelope(encoded, sender string, maxFee uint32) (xdr.TransactionEnvelope, *xdr.InvokeHostFunctionOp, error) {
+	env, err := decodeEnvelope(encoded)
+	if err != nil {
+		return env, nil, err
+	}
+	if err := checkTransaction(&env.V1.Tx, sender, maxFee); err != nil {
+		return env, nil, err
+	}
+	invoke, err := singleInvocation(env.V1.Tx.Operations[0])
+	return env, invoke, err
+}
+
 // decodeEnvelope decodes a base64 envelope and requires an unsigned v1 transaction.
 func decodeEnvelope(envelopeB64 string) (xdr.TransactionEnvelope, error) {
 	var env xdr.TransactionEnvelope
@@ -94,7 +101,7 @@ func decodeEnvelope(envelopeB64 string) (xdr.TransactionEnvelope, error) {
 
 // checkTransaction requires a memo-less transaction from the sender's plain
 // account with a bounded fee, Soroban resource data and exactly one operation.
-func checkTransaction(tx *xdr.Transaction, sender string) error {
+func checkTransaction(tx *xdr.Transaction, sender string, maxFee uint32) error {
 	if tx.SourceAccount.Type != xdr.CryptoKeyTypeKeyTypeEd25519 {
 		return errors.New("envelope source is not a plain account")
 	}
@@ -104,8 +111,8 @@ func checkTransaction(tx *xdr.Transaction, sender string) error {
 	if tx.Memo.Type != xdr.MemoTypeMemoNone {
 		return errors.New("envelope carries a memo")
 	}
-	if tx.Fee == 0 || tx.Fee > maxEnvelopeFee {
-		return fmt.Errorf("envelope fee %d is outside (0, %d]", tx.Fee, maxEnvelopeFee)
+	if tx.Fee == 0 || tx.Fee > xdr.Uint32(maxFee) {
+		return fmt.Errorf("envelope fee %d is outside (0, %d]", tx.Fee, maxFee)
 	}
 	if tx.Ext.V != 1 || tx.Ext.SorobanData == nil {
 		return errors.New("envelope has no soroban resource data")

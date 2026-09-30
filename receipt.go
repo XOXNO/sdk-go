@@ -14,10 +14,15 @@ type SwapReceipt struct {
 	AmountIn, AmountOut *big.Int
 }
 
-// ReadReceipt reads confirmed output, never quoted output or a route minimum.
-// Nil means unavailable or not an attributable XOXNO receipt. Signed envelopes
-// are accepted here; this reader is not an unsigned signing-policy validator.
-func ReadReceipt(envelopeXDR, resultXDR, metaXDR, router, viewer string, operationIndex int) (*SwapReceipt, error) {
+// ConfirmedInvocation carries events bound to a successful selected invocation.
+type ConfirmedInvocation struct {
+	Call   *xdr.InvokeContractArgs
+	events []xdr.ContractEvent
+}
+
+// ReadConfirmedInvocation verifies successful operation results and their event
+// preimage. v3 multi-operation metadata and unbound v4 events are unavailable.
+func ReadConfirmedInvocation(envelopeXDR, resultXDR, metaXDR string, operationIndex int) (*ConfirmedInvocation, error) {
 	var env xdr.TransactionEnvelope
 	if e := xdr.SafeUnmarshalBase64(envelopeXDR, &env); e != nil {
 		return nil, e
@@ -60,38 +65,6 @@ func ReadReceipt(envelopeXDR, resultXDR, metaXDR, router, viewer string, operati
 	if host.Type != xdr.HostFunctionTypeHostFunctionTypeInvokeContract || host.InvokeContract == nil {
 		return nil, nil
 	}
-	call := host.InvokeContract
-	id, e := call.ContractAddress.String()
-	if e != nil || id != router || string(call.FunctionName) != routerFunction || len(call.Args) != 3 {
-		return nil, nil
-	}
-	sender, e := scValAddress(call.Args[0])
-	if e != nil || sender != viewer {
-		return nil, nil
-	}
-	input, e := scValI128(call.Args[1])
-	if e != nil || input.Sign() <= 0 || call.Args[2].Bytes == nil || call.Args[2].Type != xdr.ScValTypeScvBytes {
-		return nil, nil
-	}
-	fields, e := decodeRoutePayload(*call.Args[2].Bytes)
-	if e != nil {
-		return nil, e
-	}
-	header, e := routeHeader(fields["ops"])
-	if e != nil {
-		return nil, e
-	}
-	in, e := vecAt(fields["assets"], int(header[routeHdrTokenIn]), scValAddress)
-	if e != nil {
-		return nil, e
-	}
-	out, e := vecAt(fields["assets"], int(header[routeHdrTokenOut]), scValAddress)
-	if e != nil {
-		return nil, e
-	}
-	if !validContract(in) || !validContract(out) || in == out {
-		return nil, nil
-	}
 	var meta xdr.TransactionMeta
 	if e := xdr.SafeUnmarshalBase64(metaXDR, &meta); e != nil {
 		return nil, e
@@ -127,13 +100,64 @@ func ReadReceipt(envelopeXDR, resultXDR, metaXDR, router, viewer string, operati
 	if expected == nil || xdr.Hash(sha256.Sum256(preimage)) != *expected {
 		return nil, nil
 	}
+	return &ConfirmedInvocation{Call: host.InvokeContract, events: events}, nil
+}
+
+// ReadReceipt reads actual XOXNO output; unsupported records return nil.
+func ReadReceipt(envelopeXDR, resultXDR, metaXDR, router, viewer string, operationIndex int) (*SwapReceipt, error) {
+	invocation, e := ReadConfirmedInvocation(envelopeXDR, resultXDR, metaXDR, operationIndex)
+	if e != nil || invocation == nil {
+		return nil, e
+	}
+	call := invocation.Call
+	id, e := call.ContractAddress.String()
+	if e != nil || id != router || string(call.FunctionName) != routerFunction || len(call.Args) != 3 {
+		return nil, nil
+	}
+	sender, e := scValAddress(call.Args[0])
+	if e != nil || sender != viewer {
+		return nil, nil
+	}
+	input, e := scValI128(call.Args[1])
+	if e != nil || input.Sign() <= 0 || call.Args[2].Bytes == nil || call.Args[2].Type != xdr.ScValTypeScvBytes {
+		return nil, nil
+	}
+	fields, e := decodeRoutePayload(*call.Args[2].Bytes)
+	if e != nil {
+		return nil, e
+	}
+	header, e := routeHeader(fields["ops"])
+	if e != nil {
+		return nil, e
+	}
+	in, e := vecAt(fields["assets"], int(header[routeHdrTokenIn]), scValAddress)
+	if e != nil {
+		return nil, e
+	}
+	out, e := vecAt(fields["assets"], int(header[routeHdrTokenOut]), scValAddress)
+	if e != nil {
+		return nil, e
+	}
+	if !validContract(in) || !validContract(out) || in == out {
+		return nil, nil
+	}
+	received, e := invocation.ReceivedTokenAmount(out, viewer, router)
+	if e != nil || received == nil {
+		return nil, e
+	}
+	return &SwapReceipt{TokenIn: in, TokenOut: out, AmountIn: input, AmountOut: received}, nil
+}
+
+// ReceivedTokenAmount sums output-token transfers to the viewer, excluding self
+// transfers. A nonempty source restricts payout origin (the XOXNO router).
+func (invocation *ConfirmedInvocation) ReceivedTokenAmount(token, viewer, source string) (*big.Int, error) {
 	received := new(big.Int)
-	for _, event := range events {
+	for _, event := range invocation.events {
 		if event.Type != xdr.ContractEventTypeContract || event.ContractId == nil || event.Body.V != 0 || event.Body.V0 == nil {
 			continue
 		}
 		id, e := strkey.Encode(strkey.VersionByteContract, event.ContractId[:])
-		if e != nil || id != out {
+		if e != nil || id != token {
 			continue
 		}
 		v := event.Body.V0
@@ -142,7 +166,7 @@ func ReadReceipt(envelopeXDR, resultXDR, metaXDR, router, viewer string, operati
 			continue
 		}
 		from, e := scValAddress(topics[1])
-		if e != nil || from != router {
+		if e != nil || from == viewer || (source != "" && from != source) {
 			continue
 		}
 		to, e := scValAddress(topics[2])
@@ -174,5 +198,5 @@ func ReadReceipt(envelopeXDR, resultXDR, metaXDR, router, viewer string, operati
 	if received.Sign() == 0 {
 		return nil, nil
 	}
-	return &SwapReceipt{TokenIn: in, TokenOut: out, AmountIn: input, AmountOut: received}, nil
+	return received, nil
 }
